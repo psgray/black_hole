@@ -1,177 +1,354 @@
 #version 430
+// ---------------------------------------------------------------------------
+//  Schwarzschild null-geodesic ray tracer (compute shader)
+//
+//  Every pixel launches one light ray backwards from the camera.  Because the
+//  Schwarzschild metric is spherically symmetric each ray stays in the plane
+//  spanned by the camera position and the ray direction, so we integrate the
+//  exact orbit equation (Binet form) in that plane:
+//
+//        d^2u / dphi^2 = -u + (3/2) * u^2          with u = r_s / r
+//
+//  using a classical 4th-order Runge-Kutta scheme with an adaptive step.
+//  This has no coordinate singularities (unlike spherical (r,theta,phi)
+//  integration) and converges in a few hundred steps instead of tens of
+//  thousands.  All lengths inside the shader are measured in Schwarzschild
+//  radii (r_s = 1).
+//
+//  What a ray can hit:
+//    * the event horizon            -> black
+//    * the thin accretion disk      -> blackbody colour with gravitational
+//                                      redshift + relativistic Doppler beaming
+//    * a star / planet (sphere)     -> emissive sphere with limb darkening
+//    * nothing (escapes)            -> procedural, gravitationally lensed sky
+// ---------------------------------------------------------------------------
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(binding = 0, rgba8) writeonly uniform image2D outImage;
+
 layout(std140, binding = 1) uniform Camera {
-    vec3 camPos;     float _pad0;
-    vec3 camRight;   float _pad1;
-    vec3 camUp;      float _pad2;
-    vec3 camForward; float _pad3;
+    vec3  camPos;     float _pad0;   // metres
+    vec3  camRight;   float _pad1;
+    vec3  camUp;      float _pad2;
+    vec3  camForward; float _pad3;
     float tanHalfFov;
     float aspect;
-    bool moving;
+    int   moving;                    // 1 while the user drags the camera
     int   _pad4;
 } cam;
 
-layout(std140, binding = 2) uniform Disk {
-    float disk_r1;
-    float disk_r2;
-    float disk_num;
-    float thickness;
+layout(std140, binding = 2) uniform Params {
+    float disk_r1;     // inner disk radius (metres)
+    float disk_r2;     // outer disk radius (metres)
+    float rs;          // Schwarzschild radius (metres)
+    float simTime;     // simulated seconds since start (drives disk rotation)
+    int   flags;       // bit0 disk, bit1 starfield, bit2 doppler/redshift, bit3 disk texture
+    int   maxSteps;
+    float escapeR;     // in units of rs
+    float exposure;
 };
 
 layout(std140, binding = 3) uniform Objects {
-    int numObjects;
-    vec4 objPosRadius[16];
-    vec4 objColor[16];
-    float  mass[16]; 
+    int  numObjects;
+    vec4 objPosRadius[16];   // xyz = centre (metres), w = radius (metres)
+    vec4 objColor[16];       // rgb = colour, a = emissive strength
 };
 
-const float SagA_rs = 1.269e10;
-const float D_LAMBDA = 1e7;
-const double ESCAPE_R = 1e30;
+const int FLAG_DISK     = 1;
+const int FLAG_STARS    = 2;
+const int FLAG_DOPPLER  = 4;
+const int FLAG_DISK_TEX = 8;
 
-// Globals to store hit info
-vec4 objectColor = vec4(0.0);
-vec3 hitCenter = vec3(0.0);
-float hitRadius = 0.0;
+const float PI = 3.14159265358979;
+const float C_LIGHT = 299792458.0;
 
-struct Ray {
-    float x, y, z, r, theta, phi;
-    float dr, dtheta, dphi;
-    float E, L;
-};
-Ray initRay(vec3 pos, vec3 dir) {
-    Ray ray;
-    ray.x = pos.x; ray.y = pos.y; ray.z = pos.z;
-    ray.r = length(pos);
-    ray.theta = acos(pos.z / ray.r);
-    ray.phi = atan(pos.y, pos.x);
+bool hasFlag(int f) { return (flags & f) != 0; }
 
-    float dx = dir.x, dy = dir.y, dz = dir.z;
-    ray.dr     = sin(ray.theta)*cos(ray.phi)*dx + sin(ray.theta)*sin(ray.phi)*dy + cos(ray.theta)*dz;
-    ray.dtheta = (cos(ray.theta)*cos(ray.phi)*dx + cos(ray.theta)*sin(ray.phi)*dy - sin(ray.theta)*dz) / ray.r;
-    ray.dphi   = (-sin(ray.phi)*dx + cos(ray.phi)*dy) / (ray.r * sin(ray.theta));
-
-    ray.L = ray.r * ray.r * sin(ray.theta) * ray.dphi;
-    float f = 1.0 - SagA_rs / ray.r;
-    float dt_dL = sqrt((ray.dr*ray.dr)/f + ray.r*ray.r*(ray.dtheta*ray.dtheta + sin(ray.theta)*sin(ray.theta)*ray.dphi*ray.dphi));
-    ray.E = f * dt_dL;
-
-    return ray;
+// ------------------------------------------------------------ hashing / noise
+float hash13(vec3 p3) {
+    p3 = fract(p3 * 0.1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
+}
+vec2 hash23(vec3 p3) {
+    p3 = fract(p3 * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+float vnoise3(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(i + vec3(0, 0, 0)), n100 = hash13(i + vec3(1, 0, 0));
+    float n010 = hash13(i + vec3(0, 1, 0)), n110 = hash13(i + vec3(1, 1, 0));
+    float n001 = hash13(i + vec3(0, 0, 1)), n101 = hash13(i + vec3(1, 0, 1));
+    float n011 = hash13(i + vec3(0, 1, 1)), n111 = hash13(i + vec3(1, 1, 1));
+    return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+               mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+float fbm3(vec3 p) {
+    float a = 0.5, s = 0.0;
+    for (int i = 0; i < 4; ++i) { s += a * vnoise3(p); p = p * 2.03 + 17.1; a *= 0.5; }
+    return s;
 }
 
-bool intercept(Ray ray, float rs) {
-    return ray.r <= rs;
+// ------------------------------------------------------------ colour helpers
+// Approximate sRGB colour of a blackbody at temperature T (Kelvin).
+vec3 blackbody(float T) {
+    float x = clamp(T, 1000.0, 40000.0) / 100.0;
+    float r, g, b;
+    if (x <= 66.0) {
+        r = 1.0;
+        g = clamp(0.39008157876901960784 * log(x) - 0.63184144378862745098, 0.0, 1.0);
+    } else {
+        r = clamp(1.29293618606274509804 * pow(x - 60.0, -0.1332047592), 0.0, 1.0);
+        g = clamp(1.12989086089529411765 * pow(x - 60.0, -0.0755148492), 0.0, 1.0);
+    }
+    if (x >= 66.0)      b = 1.0;
+    else if (x <= 19.0) b = 0.0;
+    else                b = clamp(0.54320678911019607843 * log(x - 10.0) - 1.19625408914, 0.0, 1.0);
+    return vec3(r, g, b);
 }
-// Returns true on hit, captures center, radius, and base color
-bool interceptObject(Ray ray) {
-    vec3 P = vec3(ray.x, ray.y, ray.z);
-    for (int i = 0; i < numObjects; ++i) {
-        vec3 center = objPosRadius[i].xyz;
-        float radius = objPosRadius[i].w;
-        if (distance(P, center) <= radius) {
-            objectColor = objColor[i];
-            hitCenter = center;
-            hitRadius = radius;
-            return true;
+vec3 tonemap(vec3 c) {
+    c *= exposure;
+    // ACES filmic curve (Narkowicz fit), then sRGB gamma
+    c = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
+    return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
+}
+
+// ------------------------------------------------------------ starfield
+// Procedural sky evaluated for an escape direction.  Uses a cube-map style
+// parameterisation so the star density is roughly uniform over the sphere.
+vec3 starfield(vec3 d) {
+    vec3 a = abs(d);
+    int face; vec2 uv;
+    if (a.x >= a.y && a.x >= a.z) { face = d.x > 0.0 ? 0 : 1; uv = d.yz / a.x; }
+    else if (a.y >= a.z)          { face = d.y > 0.0 ? 2 : 3; uv = d.xz / a.y; }
+    else                          { face = d.z > 0.0 ? 4 : 5; uv = d.xy / a.z; }
+    uv = uv * 0.5 + 0.5;
+
+    vec3 col = vec3(0.0);
+    for (int layer = 0; layer < 2; ++layer) {
+        float N = (layer == 0) ? 56.0 : 22.0;
+        vec2 g = uv * N;
+        vec2 cell = floor(g);
+        vec2 f = g - cell;
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec2 c = cell + vec2(dx, dy);
+            vec3 seed = vec3(c, float(face * 2 + layer) * 7.31 + 3.0);
+            float h = hash13(seed);
+            float density = (layer == 0) ? 0.55 : 0.35;
+            if (h > density) continue;
+            vec2 sp = hash23(seed + 1.7);
+            vec2 delta = f - (vec2(dx, dy) + sp);
+            float d2 = dot(delta, delta);
+            float mag = hash13(seed + 9.1);
+            float bright = pow(mag, 6.0) * ((layer == 0) ? 1.2 : 2.5);
+            float size = 0.035 + 0.05 * bright;
+            float s = exp(-d2 / (size * size));
+            // tint: hot blue-white to cool orange
+            float t = hash13(seed + 4.2);
+            vec3 tint = mix(vec3(1.0, 0.75, 0.55), vec3(0.75, 0.85, 1.0), t);
+            col += tint * bright * s;
         }
     }
-    return false;
+    // faint galactic band
+    vec3 bandAxis = normalize(vec3(0.25, 1.0, 0.15));
+    float band = exp(-10.0 * abs(dot(d, bandAxis)));
+    float cloud = fbm3(d * 6.0);
+    col += vec3(0.05, 0.055, 0.085) * band * (0.3 + 1.0 * cloud * cloud);
+    return col;
 }
 
-void geodesicRHS(Ray ray, out vec3 d1, out vec3 d2) {
-    float r = ray.r, theta = ray.theta;
-    float dr = ray.dr, dtheta = ray.dtheta, dphi = ray.dphi;
-    float f = 1.0 - SagA_rs / r;
-    float dt_dL = ray.E / f;
-
-    d1 = vec3(dr, dtheta, dphi);
-    d2.x = - (SagA_rs / (2.0 * r*r)) * f * dt_dL * dt_dL
-         + (SagA_rs / (2.0 * r*r * f)) * dr * dr
-         + r * (dtheta*dtheta + sin(theta)*sin(theta)*dphi*dphi);
-    d2.y = -2.0*dr*dtheta/r + sin(theta)*cos(theta)*dphi*dphi;
-    d2.z = -2.0*dr*dphi/r - 2.0*cos(theta)/(sin(theta)) * dtheta * dphi;
-}
-void rk4Step(inout Ray ray, float dL) {
-    vec3 k1a, k1b;
-    geodesicRHS(ray, k1a, k1b);
-
-    ray.r      += dL * k1a.x;
-    ray.theta  += dL * k1a.y;
-    ray.phi    += dL * k1a.z;
-    ray.dr     += dL * k1b.x;
-    ray.dtheta += dL * k1b.y;
-    ray.dphi   += dL * k1b.z;
-
-    ray.x = ray.r * sin(ray.theta) * cos(ray.phi);
-    ray.y = ray.r * sin(ray.theta) * sin(ray.phi);
-    ray.z = ray.r * cos(ray.theta);
-}
-bool crossesEquatorialPlane(vec3 oldPos, vec3 newPos) {
-    bool crossed = (oldPos.y * newPos.y < 0.0);
-    float r = length(vec2(newPos.x, newPos.z));
-    return crossed && (r >= disk_r1 && r <= disk_r2);
+// ------------------------------------------------------------ geodesic ODE
+// state s = (u, du/dphi),  u = r_s / r
+vec2 rhs(vec2 s) { return vec2(s.y, -s.x + 1.5 * s.x * s.x); }
+void rk4(inout vec2 s, float h) {
+    vec2 k1 = rhs(s);
+    vec2 k2 = rhs(s + 0.5 * h * k1);
+    vec2 k3 = rhs(s + 0.5 * h * k2);
+    vec2 k4 = rhs(s + h * k3);
+    s += (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
 }
 
+// Segment / sphere intersection.  Returns parametric t in [0,1] or -1.
+float segmentSphere(vec3 p0, vec3 p1, vec3 C, float R) {
+    vec3 d = p1 - p0;
+    vec3 m = p0 - C;
+    float a = dot(d, d);
+    float b = dot(m, d);
+    float c = dot(m, m) - R * R;
+    if (c <= 0.0) return 0.0;              // already inside
+    if (b > 0.0) return -1.0;              // moving away
+    float disc = b * b - a * c;
+    if (disc < 0.0) return -1.0;
+    float t = (-b - sqrt(disc)) / a;
+    return (t >= 0.0 && t <= 1.0) ? t : -1.0;
+}
+
+// ------------------------------------------------------------ disk shading
+vec3 shadeDisk(vec3 X, vec3 photonDir /* direction light travels, towards camera */) {
+    float r   = length(X.xz);               // in rs
+    float r1  = disk_r1 / rs;
+    float r2  = disk_r2 / rs;
+
+    // Thin-disk temperature profile  T^4 ~ r^-3 (1 - sqrt(r_in / r))
+    // Normalised so that T(r1) = Tmax; cools to ~0.67 Tmax at the outer edge.
+    float Tmax = 4200.0;
+    float x = r1 / r;
+    float T = Tmax * pow(x, 0.75) * pow(max(1.0 - 0.85 * sqrt(x), 0.0), 0.25) / 0.62;
+
+    // Keplerian orbital velocity measured by a static observer (G = c = 1, rs = 2M)
+    vec3 rhat = normalize(vec3(X.x, 0.0, X.z));
+    vec3 vdir = normalize(cross(vec3(0.0, 1.0, 0.0), rhat));   // prograde (counter-clockwise from +y)
+    float beta = sqrt(0.5 / max(r - 1.0, 0.75));
+    beta = min(beta, 0.95);
+
+    float g = 1.0;
+    if (hasFlag(FLAG_DOPPLER)) {
+        float cosA  = dot(vdir, photonDir);
+        float gamma = 1.0 / sqrt(1.0 - beta * beta);
+        float fgrav = sqrt(max(1.0 - 1.0 / r, 0.0));
+        g = fgrav / (gamma * (1.0 - beta * cosA));             // observed / emitted frequency
+    }
+
+    // turbulent streaks co-rotating with the gas
+    float tex = 1.0;
+    if (hasFlag(FLAG_DISK_TEX)) {
+        float omega = C_LIGHT * sqrt(0.5 / (r * r * r)) / rs;   // rad / s (Kepler)
+        float phi = atan(X.z, X.x) - omega * simTime;
+        vec3 p = vec3(cos(phi) * 4.0, sin(phi) * 4.0, log(r) * 6.0);
+        float n = fbm3(p);
+        float n2 = fbm3(p * 2.7 + 5.0);
+        tex = 0.45 + 1.2 * n + 0.6 * n2 * n2;
+    }
+
+    // soft inner / outer edges
+    float fade = smoothstep(r1, r1 * 1.08, r) * (1.0 - smoothstep(r2 * 0.80, r2, r));
+
+    float Tobs = g * T;
+    // bolometric brightness ~ T^4 (thin disk), beamed by g^3 (specific intensity)
+    float intensity = pow(T / Tmax, 4.0) * pow(g, 3.0) * tex * fade * 0.55;
+    return blackbody(Tobs) * intensity;
+}
+
+// ------------------------------------------------------------ main
 void main() {
-    int WIDTH  = cam.moving ? 200 : 200;
-    int HEIGHT = cam.moving ? 150 : 150;
+    ivec2 size = imageSize(outImage);
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= size.x || pix.y >= size.y) return;
 
-    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
-    if (pix.x >= WIDTH || pix.y >= HEIGHT) return;
+    // primary ray in the camera's local frame
+    float u_ = (2.0 * (float(pix.x) + 0.5) / float(size.x) - 1.0) * cam.aspect * cam.tanHalfFov;
+    float v_ = (2.0 * (float(pix.y) + 0.5) / float(size.y) - 1.0) * cam.tanHalfFov;
+    vec3 D = normalize(cam.camForward + u_ * cam.camRight + v_ * cam.camUp);
 
-    // Init Ray
-    float u = (2.0 * (pix.x + 0.5) / WIDTH - 1.0) * cam.aspect * cam.tanHalfFov;
-    float v = (1.0 - 2.0 * (pix.y + 0.5) / HEIGHT) * cam.tanHalfFov;
-    vec3 dir = normalize(u * cam.camRight - v * cam.camUp + cam.camForward);
-    Ray ray = initRay(cam.camPos, dir);
+    // --- set up the orbital plane (everything in units of rs) ---
+    vec3 O  = cam.camPos / rs;
+    float r0 = length(O);
+    vec3 er  = O / r0;
+    float Dr = dot(D, er);
+    vec3 tang = D - Dr * er;
+    float Dt = length(tang);
+    if (Dt < 1e-5) {                       // purely radial ray: pick any perpendicular
+        vec3 anyv = abs(er.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+        tang = normalize(cross(er, anyv)) * 1e-5;
+        Dt = 1e-5;
+    }
+    vec3 ephi = tang / Dt;
 
-    vec4 color = vec4(0.0);
-    vec3 prevPos = vec3(ray.x, ray.y, ray.z);
-    float lambda = 0.0;
+    // The camera is a static observer; its local orthonormal frame relates to
+    // Schwarzschild coordinates by dr_phys = dr / sqrt(f).  Hence
+    //   dr/dphi = r * (Dr * sqrt(f)) / Dt      and     du/dphi = -(dr/dphi) / r^2
+    float f0 = max(1.0 - 1.0 / r0, 1e-4);
+    vec2 s = vec2(1.0 / r0, -(Dr * sqrt(f0)) / (r0 * Dt));
+    float phi = 0.0;
+    vec3 pos = O;
 
-    bool hitBlackHole = false;
-    bool hitDisk      = false;
-    bool hitObject    = false;
+    bool hitBH = false, hitDisk = false, hitObj = false, escaped = false;
+    vec3 hitPos = vec3(0.0), segDir = D;
+    int  hitIndex = -1;
+    vec3 escapeDir = D;
 
-    int steps = cam.moving ? 60000 : 60000;
+    const float minStep = 0.04;            // rs; comparable to disk / sphere scale
+    for (int i = 0; i < maxSteps; ++i) {
+        float u = s.x;
+        float r = 1.0 / u;
+        float drdphi = -s.y * r * r;
 
-    for (int i = 0; i < steps; ++i) {
-        if (intercept(ray, SagA_rs)) { hitBlackHole = true; break; }
-        rk4Step(ray, D_LAMBDA);
-        lambda += D_LAMBDA;
+        // adaptive step: limit the Cartesian displacement per step
+        float stepLen = max(0.02 * r, minStep);
+        float h = min(stepLen / sqrt(r * r + drdphi * drdphi), 0.05);
 
-        vec3 newPos = vec3(ray.x, ray.y, ray.z);
-        if (crossesEquatorialPlane(prevPos, newPos)) { hitDisk = true; break; }
-        if (interceptObject(ray)) { hitObject = true; break; }
-        prevPos = newPos;
-        if (ray.r > ESCAPE_R) break;
+        rk4(s, h);
+        phi += h;
+
+        if (s.x <= 0.0) { escaped = true; break; }       // passed through infinity
+        if (s.x >= 1.0) { hitBH = true; break; }         // crossed the horizon
+
+        float rn = 1.0 / s.x;
+        vec3 newPos = rn * (cos(phi) * er + sin(phi) * ephi);
+
+        // accretion disk: equatorial plane crossing within [r1, r2]
+        if (hasFlag(FLAG_DISK) && pos.y * newPos.y < 0.0) {
+            float t = pos.y / (pos.y - newPos.y);
+            vec3 X = mix(pos, newPos, t);
+            float rx = length(X.xz) * rs;
+            if (rx >= disk_r1 && rx <= disk_r2) {
+                hitDisk = true; hitPos = X; segDir = normalize(newPos - pos);
+                break;
+            }
+        }
+
+        // spheres (stars / planets)
+        float bestT = 2.0;
+        for (int k = 0; k < numObjects; ++k) {
+            vec3 C = objPosRadius[k].xyz / rs;
+            float R = objPosRadius[k].w / rs;
+            float t = segmentSphere(pos, newPos, C, R);
+            if (t >= 0.0 && t < bestT) { bestT = t; hitIndex = k; }
+        }
+        if (hitIndex >= 0) {
+            hitObj = true; hitPos = mix(pos, newPos, bestT); segDir = normalize(newPos - pos);
+            break;
+        }
+
+        pos = newPos;
+        if (rn > escapeR && s.y < 0.0) {                 // far away and still moving outwards
+            float drd = -s.y * rn * rn;
+            escapeDir = normalize(drd * (cos(phi) * er + sin(phi) * ephi)
+                                  + rn * (-sin(phi) * er + cos(phi) * ephi));
+            escaped = true;
+            break;
+        }
     }
 
+    vec3 color = vec3(0.0);
     if (hitDisk) {
-        double r = length(vec3(ray.x, ray.y, ray.z)) / disk_r2;
-        vec3 diskColor = vec3(1.0, r, 0.2);
-        //r = 1.0 - abs(r - 0.5) * 2.0;
-        color = vec4(diskColor, r);
-
-    } else if (hitBlackHole) {
-        color = vec4(0.0, 0.0, 0.0, 1.0);
-
-    } else if (hitObject) {
-        // Compute shading
-        vec3 P = vec3(ray.x, ray.y, ray.z);
-        vec3 N = normalize(P - hitCenter);
-        vec3 V = normalize(cam.camPos - P);
-        float ambient = 0.1;
-        float diff = max(dot(N, V), 0.0);
-        float intensity = ambient + (1.0 - ambient) * diff;
-        vec3 shaded = objectColor.rgb * intensity;
-        color = vec4(shaded, objectColor.a);
-
+        color = shadeDisk(hitPos, -segDir);
+    } else if (hitBH) {
+        color = vec3(0.0);
+    } else if (hitObj) {
+        vec3 C = objPosRadius[hitIndex].xyz / rs;
+        vec3 N = normalize(hitPos - C);
+        vec3 V = -segDir;                                 // towards the camera
+        float ndv = max(dot(N, V), 0.0);
+        vec4 oc = objColor[hitIndex];
+        float emissive = oc.a;
+        // limb darkening for stars, lambert-ish shading for non-emissive bodies
+        float limb = 0.45 + 0.55 * pow(ndv, 0.6);
+        vec3 lit = oc.rgb * mix(0.15 + 0.85 * ndv, limb * 2.5, emissive);
+        color = lit;
     } else {
-        color = vec4(0.0);
+        // escaped: sample the sky in the (lensed) asymptotic direction
+        if (hasFlag(FLAG_STARS)) {
+            vec3 d = escaped ? escapeDir : D;
+            color = starfield(d);
+        }
     }
 
-    imageStore(outImage, pix, color);
+    // alpha = 1 where the ray reached the sky; the grid overlay uses it so the
+    // black hole, disk and stars occlude the spacetime grid behind them.
+    float sky = (hitDisk || hitBH || hitObj) ? 0.0 : 1.0;
+    imageStore(outImage, pix, vec4(tonemap(color), sky));
 }
