@@ -14,6 +14,7 @@
 //    T                toggle disk texture   W                toggle spacetime grid
 //    + / -            time scale x2 / /2    [ / ]            exposure
 //    A                auto resolution       H                print help
+//    F11              fullscreen            F12              screenshot
 //    Esc              quit
 //
 //  This is purely a computer simulation.  No actual black holes are produced,
@@ -266,6 +267,31 @@ struct Engine {
     int WIDTH = 1280, HEIGHT = 800;          // framebuffer size (updated on resize)
     int texW = 0, texH = 0;                  // current compute texture size
     static bool noFocus;                     // create the window without taking keyboard focus
+    bool fullscreen = false;
+    int  winX = 100, winY = 100, winW = 1280, winH = 800;   // windowed placement, restored on F11
+
+    // Borderless fullscreen on the monitor the window currently occupies.
+    void toggleFullscreen() {
+        if (!fullscreen) {
+            glfwGetWindowPos(window, &winX, &winY);
+            glfwGetWindowSize(window, &winW, &winH);
+            GLFWmonitor* mon = glfwGetPrimaryMonitor();
+            int cx = winX + winW / 2, cy = winY + winH / 2, count = 0;
+            GLFWmonitor** mons = glfwGetMonitors(&count);
+            for (int i = 0; i < count; ++i) {
+                int mx, my; glfwGetMonitorPos(mons[i], &mx, &my);
+                const GLFWvidmode* vm = glfwGetVideoMode(mons[i]);
+                if (cx >= mx && cx < mx + vm->width && cy >= my && cy < my + vm->height) mon = mons[i];
+            }
+            const GLFWvidmode* mode = glfwGetVideoMode(mon);
+            glfwSetWindowMonitor(window, mon, 0, 0, mode->width, mode->height, mode->refreshRate);
+        } else {
+            glfwSetWindowMonitor(window, nullptr, winX, winY, winW, winH, 0);
+        }
+        fullscreen = !fullscreen;
+        glfwGetFramebufferSize(window, &WIDTH, &HEIGHT);
+        cout << "[INFO] " << (fullscreen ? "fullscreen " : "windowed ") << WIDTH << "x" << HEIGHT << endl;
+    }
 
     Engine() {
         if (!glfwInit()) { cerr << "GLFW init failed\n"; exit(EXIT_FAILURE); }
@@ -588,8 +614,8 @@ static void printHelp() {
         "  B           Doppler/redshift    T          disk texture\n"
         "  W           spacetime grid      + / -      time scale x2 / /2\n"
         "  [ / ]       exposure            A          auto resolution scaling\n"
-        "  F12         save screenshot     H          this help\n"
-        "  Esc         quit\n\n";
+        "  F11         fullscreen          F12        save screenshot\n"
+        "  H           this help           Esc        quit\n\n";
 }
 static bool screenshotRequested = false;   // set by F12, consumed in the render loop
 static void onKey(GLFWwindow* win, int key, int /*scancode*/, int action, int mods) {
@@ -620,6 +646,7 @@ static void onKey(GLFWwindow* win, int key, int /*scancode*/, int action, int mo
         if (!sim.autoScale) sim.renderScale = 1.0f;
         cout << "[INFO] auto resolution " << (sim.autoScale ? "on" : "off (full resolution)") << endl; break;
     case GLFW_KEY_H: printHelp(); break;
+    case GLFW_KEY_F11: engine->toggleFullscreen(); break;
     case GLFW_KEY_F12: screenshotRequested = true; break;
     default: break;
     }
@@ -705,17 +732,19 @@ static void applyKeyString(GLFWwindow* win, const string& keys) {
 //   --stats              print frame statistics to the console every 2 s
 //   --no-vsync           uncapped frame rate (useful with --stats)
 //   --size WxH           initial window size, e.g. --size 1920x1080
+//   --fullscreen         start in borderless fullscreen (F11 toggles)
 //   --keys <chars>       apply key toggles at start-up, e.g. --keys bw
 //   --camera az,el,d     initial camera: azimuth and elevation in radians, distance in r_s
 //   --screenshot <file>  render --frames N frames (default 90), save a BMP and exit
 int main(int argc, char** argv) {
-    bool stats = false, vsync = true;
+    bool stats = false, vsync = true, startFullscreen = false;
     int reqW = 0, reqH = 0, exitAfterFrames = 90;
     string keys, screenshotPath;
     for (int i = 1; i < argc; ++i) {
         string a = argv[i];
         if (a == "--stats") stats = true;
         else if (a == "--no-vsync") vsync = false;
+        else if (a == "--fullscreen") startFullscreen = true;
         else if (a == "--size" && i + 1 < argc) { if (sscanf(argv[++i], "%dx%d", &reqW, &reqH) != 2) reqW = reqH = 0; }
         else if (a == "--keys" && i + 1 < argc) keys = argv[++i];
         else if (a == "--screenshot" && i + 1 < argc) screenshotPath = argv[++i];
@@ -727,7 +756,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--help" || a == "-h") {
-            cout << "usage: BlackHole3D [--stats] [--no-vsync] [--size WxH] [--keys <chars>]\n"
+            cout << "usage: BlackHole3D [--stats] [--no-vsync] [--fullscreen] [--size WxH] [--keys <chars>]\n"
                     "                   [--camera az,el,dist_rs] [--screenshot <file.bmp> [--frames N]]\n"; return 0;
         }
     }
@@ -736,6 +765,7 @@ int main(int argc, char** argv) {
     Engine eng;
     engine = &eng;
     if (reqW > 0 && reqH > 0) glfwSetWindowSize(eng.window, reqW, reqH);
+    if (startFullscreen) eng.toggleFullscreen();
     glfwSwapInterval(vsync ? 1 : 0);
     setupObjects();
     setupCallbacks(eng.window);

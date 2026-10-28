@@ -85,6 +85,7 @@ The repo ships a `CMakePresets.json`, so with Visual Studio 2026 (or 2022), CMak
 | `+` / `-` | Simulated time scale ×2 / ÷2 (default: 1 real second = 10 simulated minutes) |
 | `[` / `]` | Exposure |
 | `A` | Toggle automatic resolution scaling (targets ~30 fps on slower GPUs) |
+| `F11` | Toggle borderless fullscreen (or start with `--fullscreen`) |
 | `F12` | Save a screenshot (`blackhole_<date>.bmp`) |
 | `H` / `Esc` | Help / quit |
 
