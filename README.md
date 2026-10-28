@@ -93,6 +93,19 @@ Command-line options: `--stats`, `--no-vsync`, `--size WxH`, `--camera az,el,dis
 
 **2D demo:** left click launches a ray heading +x from the cursor, right drag pans, wheel zooms, `Space` pauses, `R` resets the default fan of rays, `C` clears.
 
+## **Screensaver (Windows)**
+
+The same source also builds `BlackHoleSaver.scr`. It harvests the icons of your installed applications (taskbar pins, Desktop and Start Menu shortcuts, read locally and never sent anywhere), packs them into a texture atlas and lets them spiral into the black hole as gravitationally lensed sprites: they orbit in a Paczyński–Wiita pseudo-Newtonian potential, decay inwards, get tidally stretched, and redshift to black as they freeze at the horizon.
+
+- **Install:** right-click `build\Release\BlackHoleSaver.scr` → *Install*, or run
+  ```bash
+  rundll32.exe desk.cpl,InstallScreenSaver D:\dev\sci\black-holes\black_hole\build\Release\BlackHoleSaver.scr
+  ```
+  The executable is statically linked (vcpkg `x64-windows-static-md`, shaders embedded), so it can live anywhere, including `C:\Windows\System32`.
+- **Preview without installing:** `BlackHoleSaver.scr /s` (or `BlackHole3D.exe --saver`). Any key, click or mouse movement exits.
+- **Icons in the interactive app:** press `I` (or start with `--icons`); `O` toggles the slow automatic camera orbit the screensaver uses.
+- Standard arguments are honoured: `/s` run, `/c` shows an about box (there are no settings), `/p` is a no-op (no preview thumbnail).
+
 ## **What the 3D renderer does**
 
 - Each pixel integrates a Schwarzschild null geodesic backwards from the camera. Because the spacetime is spherically symmetric every ray stays in a plane, so the shader integrates the exact orbit equation `d²u/dφ² = -u + (3/2)u²` (with `u = r_s/r`) with RK4 and an adaptive step. This has no polar-axis singularity and needs a few hundred steps per ray instead of tens of thousands, so the image is rendered at full window resolution.

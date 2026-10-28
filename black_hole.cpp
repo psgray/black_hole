@@ -15,7 +15,12 @@
 //    + / -            time scale x2 / /2    [ / ]            exposure
 //    A                auto resolution       H                print help
 //    F11              fullscreen            F12              screenshot
+//    I                app icons             O                auto-orbit camera
 //    Esc              quit
+//
+//  Screensaver: the same source builds BlackHoleSaver.scr, which understands
+//  the standard /s (run), /c (configure) and /p (preview) arguments, harvests
+//  the icons of installed apps and lets them spiral into the hole.
 //
 //  This is purely a computer simulation.  No actual black holes are produced,
 //  harmed, or operated by running this program.
@@ -41,6 +46,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -48,8 +54,12 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <random>
 #include <string>
 #include <vector>
+
+#include "icon_harvest.h"
+#include "shaders_embedded.h"
 
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -99,6 +109,9 @@ struct SimState {
     float  renderScale   = 1.0f;
     bool   autoScale     = true;
     double targetFps     = 30.0;
+    bool   showIcons     = false;    // app-icon sprites spiralling in
+    bool   autoOrbit     = false;    // slow automatic camera motion
+    bool   saverMode     = false;    // launched as a screensaver: exit on any input
 };
 static SimState sim;
 
@@ -218,6 +231,81 @@ static void stepOrbits(double dt) {
     }
 }
 
+// --------------------------------------------------------------- app-icon sprites
+// Each icon is a massless test particle on a decaying orbit in the
+// Paczynski-Wiita pseudo-Newtonian potential  a = -GM / (r - r_s)^2, which
+// reproduces the ISCO and the final plunge.  Near the horizon the coordinate
+// motion is slowed by the lapse (1 - r_s/r) so icons appear to freeze and
+// redshift away, as a distant observer would see.
+struct IconSprite {
+    dvec3  pos, vel;       // metres, m/s
+    int    atlasIndex = 0;
+    double halfSize = 0;   // metres
+    double spin = 0, spinRate = 0;
+    double brightness = 1.0, stretch = 1.0;
+};
+static vector<IconSprite> icons;
+static IconAtlas iconAtlas;
+static std::mt19937 rng(20251028u);
+static double nextSpawnTime = 0.0;
+static const int MAX_ICONS = 14;
+
+static double urand(double a, double b) { return std::uniform_real_distribution<double>(a, b)(rng); }
+
+static void spawnIcon() {
+    if (iconAtlas.count == 0) return;
+    IconSprite s;
+    double rs = SagA.r_s;
+    double r  = urand(7.5, 14.0) * rs;
+    double az = urand(0.0, 2.0 * M_PI);
+    double incl = urand(-0.45, 0.45);                       // mostly near the disk plane
+    dvec3 axis = glm::normalize(dvec3(std::sin(incl) * std::cos(az), std::cos(incl), std::sin(incl) * std::sin(az)));
+    // random point on the orbit circle around `axis`
+    dvec3 e1 = glm::normalize(glm::cross(axis, std::abs(axis.y) < 0.9 ? dvec3(0, 1, 0) : dvec3(1, 0, 0)));
+    dvec3 e2 = glm::cross(axis, e1);
+    double th = urand(0.0, 2.0 * M_PI);
+    s.pos = (e1 * std::cos(th) + e2 * std::sin(th)) * r;
+    double vcirc = std::sqrt(G_const * SagA.mass * r) / (r - rs);  // circular speed in the PW potential
+    s.vel = glm::cross(axis, s.pos / r) * (vcirc * urand(0.93, 1.02));
+    s.atlasIndex = int(urand(0.0, double(iconAtlas.count) - 1e-6));
+    s.halfSize = rs * urand(0.5, 0.8);
+    s.spin = urand(0.0, 2.0 * M_PI);
+    s.spinRate = urand(-0.6, 0.6);
+    icons.push_back(s);
+}
+static void stepIcons(double simDt, double realDt, double now) {
+    if (!sim.showIcons) return;
+    const double rs = SagA.r_s, GM = G_const * SagA.mass;
+    const double dragTau = 2.0e4;                            // s (sim) - orbital decay time scale
+    for (auto& s : icons) {
+        double r = glm::length(s.pos);
+        double f = std::max(1.0 - rs / r, 0.0);
+        double h = simDt * std::pow(f, 1.5);                 // coordinate time slows near the horizon
+        auto accel = [&](const dvec3& p) {
+            double rr = glm::length(p);
+            double d  = std::max(rr - rs, 0.05 * rs);
+            return -p / rr * (GM / (d * d));
+        };
+        s.vel += accel(s.pos) * (0.5 * h);
+        s.pos += s.vel * h;
+        s.vel += accel(s.pos) * (0.5 * h);
+        s.vel *= std::exp(-h / dragTau);                     // gentle drag: spiral inwards
+        s.spin += s.spinRate * realDt;
+        r = glm::length(s.pos);
+        f = std::max(1.0 - rs / r, 0.0);
+        s.brightness = std::pow(f, 0.6) * glm::smoothstep(0.06, 0.2, f);
+        s.stretch = 1.0 + 2.5 * std::pow(rs / r, 2.0);
+    }
+    icons.erase(std::remove_if(icons.begin(), icons.end(), [&](const IconSprite& s) {
+        double r = glm::length(s.pos);
+        return (1.0 - rs / r) < 0.06 || r > 60.0 * rs;
+    }), icons.end());
+    if ((int)icons.size() < MAX_ICONS && now >= nextSpawnTime) {
+        spawnIcon();
+        nextSpawnTime = now + urand(1.5, 4.0);
+    }
+}
+
 // --------------------------------------------------------------- file helpers
 static string exeDir() {
 #ifdef _WIN32
@@ -232,27 +320,21 @@ static string exeDir() {
     size_t s = p.find_last_of("\\/");
     return s == string::npos ? string(".") : p.substr(0, s);
 }
-// Shaders are looked up next to the executable first, then in the working
-// directory, then in the source tree - so the program runs from the Visual
-// Studio debugger, from a terminal, or from a copied bin folder.
-static string findShader(const string& name) {
-    const string candidates[] = {
-        exeDir() + "/" + name,
-        name,
-        string(BH_SOURCE_DIR) + "/" + name,
-    };
+// Shader sources: the interactive app prefers files on disk (next to the exe,
+// in the cwd, then the source tree) so shaders can be edited without a rebuild;
+// the screensaver, which may be installed anywhere, uses the embedded copies.
+static string loadShaderSource(const string& name) {
+#ifndef BH_SCREENSAVER
+    const string candidates[] = { exeDir() + "/" + name, name, string(BH_SOURCE_DIR) + "/" + name };
     for (const auto& c : candidates) {
         std::ifstream in(c);
-        if (in.good()) return c;
+        if (in.good()) { std::stringstream ss; ss << in.rdbuf(); return ss.str(); }
     }
-    cerr << "Could not find shader '" << name << "' (looked next to the exe, in the cwd and in "
-         << BH_SOURCE_DIR << ")\n";
+#endif
+    auto it = kEmbeddedShaders.find(name);
+    if (it != kEmbeddedShaders.end()) return it->second;
+    cerr << "Shader '" << name << "' not found on disk or embedded\n";
     exit(EXIT_FAILURE);
-}
-static string readFile(const string& path) {
-    std::ifstream in(path);
-    std::stringstream ss; ss << in.rdbuf();
-    return ss.str();
 }
 
 // --------------------------------------------------------------- engine
@@ -260,13 +342,15 @@ struct Engine {
     GLFWwindow* window = nullptr;
     GLuint quadVAO = 0, quadVBO = 0, texture = 0;
     GLuint quadProgram = 0, gridProgram = 0, computeProgram = 0;
-    GLuint cameraUBO = 0, paramsUBO = 0, objectsUBO = 0;
+    GLuint cameraUBO = 0, paramsUBO = 0, objectsUBO = 0, spritesUBO = 0;
+    GLuint atlasTex = 0;
     GLuint gridVAO = 0, gridVBO = 0, gridEBO = 0;
     int    gridIndexCount = 0;
 
     int WIDTH = 1280, HEIGHT = 800;          // framebuffer size (updated on resize)
     int texW = 0, texH = 0;                  // current compute texture size
     static bool noFocus;                     // create the window without taking keyboard focus
+    static bool coverScreen;                 // screensaver: undecorated, on top, over the whole virtual desktop
     bool fullscreen = false;
     int  winX = 100, winY = 100, winW = 1280, winH = 800;   // windowed placement, restored on F11
 
@@ -302,10 +386,27 @@ struct Engine {
             glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
             glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
         }
+        int posX = 0, posY = 0;
+        if (coverScreen) {
+            glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+            glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+            glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+#ifdef _WIN32
+            posX = GetSystemMetrics(SM_XVIRTUALSCREEN);  posY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            WIDTH = GetSystemMetrics(SM_CXVIRTUALSCREEN); HEIGHT = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+#else
+            const GLFWvidmode* vm = glfwGetVideoMode(glfwGetPrimaryMonitor());
+            WIDTH = vm->width; HEIGHT = vm->height;
+#endif
+        }
         window = glfwCreateWindow(WIDTH, HEIGHT, "Black Hole Simulation", nullptr, nullptr);
         if (!window) {
             cerr << "Failed to create an OpenGL 4.3 window (compute shaders are required)\n";
             glfwTerminate(); exit(EXIT_FAILURE);
+        }
+        if (coverScreen) {
+            glfwSetWindowPos(window, posX, posY);
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
         }
         glfwMakeContextCurrent(window);
         glfwSwapInterval(1);
@@ -321,8 +422,24 @@ struct Engine {
              << "GPU     " << glGetString(GL_RENDERER) << "\n";
 
         quadProgram    = createQuadProgram();
-        gridProgram    = createShaderProgram(findShader("grid.vert"), findShader("grid.frag"));
-        computeProgram = createComputeProgram(findShader("geodesic.comp"));
+        gridProgram    = link({ compile(GL_VERTEX_SHADER,   loadShaderSource("grid.vert"), "grid.vert"),
+                                compile(GL_FRAGMENT_SHADER, loadShaderSource("grid.frag"), "grid.frag") }, "grid");
+        computeProgram = link({ compile(GL_COMPUTE_SHADER, loadShaderSource("geodesic.comp"), "geodesic.comp") }, "compute");
+
+        glGenBuffers(1, &spritesUBO);
+        glBindBuffer(GL_UNIFORM_BUFFER, spritesUBO);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(SpritesUBO), nullptr, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 4, spritesUBO);
+
+        // 1x1 placeholder atlas so the sampler is always valid
+        glGenTextures(1, &atlasTex);
+        glBindTexture(GL_TEXTURE_2D, atlasTex);
+        unsigned char px[4] = { 0, 0, 0, 0 };
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
         glGenBuffers(1, &cameraUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
@@ -367,6 +484,48 @@ struct Engine {
         vec4  posRadius[16];
         vec4  color[16];
     };
+    struct SpritesUBO {
+        int   numSprites; float atlasCols, atlasRows, _p0;
+        vec4  posSize[32];
+        vec4  info[32];
+        vec4  normal[32];     // xyz billboard normal, w bounding radius^2 (rs units)
+        vec4  radial[32];     // xyz in-plane radial axis, w cos(spin)
+        vec4  tangent[32];    // xyz in-plane tangential axis, w sin(spin)
+    };
+
+    void uploadAtlas(const IconAtlas& a) {
+        if (a.count == 0) return;
+        glBindTexture(GL_TEXTURE_2D, atlasTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, a.width, a.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, a.rgba.data());
+    }
+    void uploadSpritesUBO(const vector<IconSprite>& sprites, const IconAtlas& a, const vec3& camPos) {
+        SpritesUBO d{};
+        int n = 0;
+        if (sim.showIcons) {
+            for (const auto& s : sprites) {
+                if (n >= 32) break;
+                vec3 C = vec3(s.pos);
+                vec3 nrm = glm::normalize(camPos - C);
+                vec3 rad = -C - glm::dot(-C, nrm) * nrm;           // towards the hole, in the billboard plane
+                float rl = glm::length(rad);
+                rad = rl > 1e-6f ? rad / rl : glm::normalize(glm::cross(nrm, vec3(0, 1, 0)));
+                vec3 tan = glm::cross(nrm, rad);
+                float hsRs = float(s.halfSize / SagA.r_s);
+                float ext  = hsRs * float(std::max(s.stretch, 1.0)) * 1.45f;   // half-diagonal incl. stretch
+                d.posSize[n] = vec4(C, float(s.halfSize));
+                d.info[n]    = vec4(float(s.atlasIndex), float(s.brightness), float(s.stretch), float(s.spin));
+                d.normal[n]  = vec4(nrm, ext * ext);
+                d.radial[n]  = vec4(rad, float(std::cos(s.spin)));
+                d.tangent[n] = vec4(tan, float(std::sin(s.spin)));
+                ++n;
+            }
+        }
+        d.numSprites = n;
+        d.atlasCols = float(std::max(a.cols, 1));
+        d.atlasRows = float(std::max(a.rows, 1));
+        glBindBuffer(GL_UNIFORM_BUFFER, spritesUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(d), &d);
+    }
 
     // ---- shaders ----
     static GLuint compile(GLenum type, const string& src, const string& label) {
@@ -414,13 +573,6 @@ struct Engine {
             void main() { FragColor = texture(screenTexture, TexCoord); })";
         return link({ compile(GL_VERTEX_SHADER, vs, "quad.vert"),
                       compile(GL_FRAGMENT_SHADER, fs, "quad.frag") }, "quad");
-    }
-    GLuint createShaderProgram(const string& vertPath, const string& fragPath) {
-        return link({ compile(GL_VERTEX_SHADER,   readFile(vertPath), vertPath),
-                      compile(GL_FRAGMENT_SHADER, readFile(fragPath), fragPath) }, "grid");
-    }
-    GLuint createComputeProgram(const string& path) {
-        return link({ compile(GL_COMPUTE_SHADER, readFile(path), path) }, "compute");
     }
 
     // ---- fullscreen quad + output texture ----
@@ -511,6 +663,10 @@ struct Engine {
         uploadCameraUBO(cam);
         uploadParamsUBO();
         uploadObjectsUBO(objects);
+        uploadSpritesUBO(icons, iconAtlas, cam.position());
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, atlasTex);
+        glUniform1i(glGetUniformLocation(computeProgram, "iconAtlas"), 1);
         glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
         glDispatchCompute((texW + 15) / 16, (texH + 15) / 16, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -601,6 +757,7 @@ struct Engine {
     }
 };
 bool Engine::noFocus = false;
+bool Engine::coverScreen = false;
 static Engine* engine = nullptr;
 
 // --------------------------------------------------------------- input
@@ -614,6 +771,7 @@ static void printHelp() {
         "  B           Doppler/redshift    T          disk texture\n"
         "  W           spacetime grid      + / -      time scale x2 / /2\n"
         "  [ / ]       exposure            A          auto resolution scaling\n"
+        "  I           app icons           O          auto-orbit camera\n"
         "  F11         fullscreen          F12        save screenshot\n"
         "  H           this help           Esc        quit\n\n";
 }
@@ -646,23 +804,48 @@ static void onKey(GLFWwindow* win, int key, int /*scancode*/, int action, int mo
         if (!sim.autoScale) sim.renderScale = 1.0f;
         cout << "[INFO] auto resolution " << (sim.autoScale ? "on" : "off (full resolution)") << endl; break;
     case GLFW_KEY_H: printHelp(); break;
+    case GLFW_KEY_I:
+        sim.showIcons = !sim.showIcons;
+        if (sim.showIcons && iconAtlas.count == 0) {
+            iconAtlas = harvestAppIcons(48);
+            engine->uploadAtlas(iconAtlas);
+            cout << "[INFO] harvested " << iconAtlas.count << " app icons" << endl;
+        }
+        break;
+    case GLFW_KEY_O: sim.autoOrbit = !sim.autoOrbit; break;
     case GLFW_KEY_F11: engine->toggleFullscreen(); break;
     case GLFW_KEY_F12: screenshotRequested = true; break;
     default: break;
     }
 }
+// Screensaver input handling: any key, button or real mouse movement ends it.
+static double saverStart = 0.0, saverMouseX = -1.0, saverMouseY = -1.0;
+static bool saverShouldExit(GLFWwindow* w, double x, double y) {
+    if (glfwGetTime() - saverStart < 0.75) { saverMouseX = x; saverMouseY = y; return false; }  // settle
+    if (saverMouseX < 0.0) { saverMouseX = x; saverMouseY = y; return false; }
+    bool moved = std::abs(x - saverMouseX) > 12.0 || std::abs(y - saverMouseY) > 12.0;
+    if (moved) glfwSetWindowShouldClose(w, GLFW_TRUE);
+    return moved;
+}
 static void setupCallbacks(GLFWwindow* window) {
     glfwSetWindowUserPointer(window, &camera);
+    saverStart = glfwGetTime();
     glfwSetMouseButtonCallback(window, [](GLFWwindow* w, int b, int a, int m) {
+        if (sim.saverMode) { if (glfwGetTime() - saverStart > 0.75) glfwSetWindowShouldClose(w, GLFW_TRUE); return; }
         static_cast<Camera*>(glfwGetWindowUserPointer(w))->processMouseButton(b, a, m, w);
     });
     glfwSetCursorPosCallback(window, [](GLFWwindow* w, double x, double y) {
+        if (sim.saverMode) { saverShouldExit(w, x, y); return; }
         static_cast<Camera*>(glfwGetWindowUserPointer(w))->processMouseMove(x, y);
     });
     glfwSetScrollCallback(window, [](GLFWwindow* w, double x, double y) {
+        if (sim.saverMode) { glfwSetWindowShouldClose(w, GLFW_TRUE); return; }
         static_cast<Camera*>(glfwGetWindowUserPointer(w))->processScroll(x, y);
     });
-    glfwSetKeyCallback(window, onKey);
+    glfwSetKeyCallback(window, [](GLFWwindow* w, int key, int sc, int action, int mods) {
+        if (sim.saverMode) { if (action == GLFW_PRESS) glfwSetWindowShouldClose(w, GLFW_TRUE); return; }
+        onKey(w, key, sc, action, mods);
+    });
     glfwSetFramebufferSizeCallback(window, [](GLFWwindow*, int w, int h) {
         engine->WIDTH = std::max(w, 1); engine->HEIGHT = std::max(h, 1);
     });
@@ -736,15 +919,38 @@ static void applyKeyString(GLFWwindow* win, const string& keys) {
 //   --keys <chars>       apply key toggles at start-up, e.g. --keys bw
 //   --camera az,el,d     initial camera: azimuth and elevation in radians, distance in r_s
 //   --screenshot <file>  render --frames N frames (default 90), save a BMP and exit
+//   --icons              show harvested app icons spiralling into the hole
+//   --saver              behave as a screensaver (cover the screen, exit on input); same as /s
 int main(int argc, char** argv) {
-    bool stats = false, vsync = true, startFullscreen = false;
+    bool stats = false, vsync = true, startFullscreen = false, wantIcons = false;
     int reqW = 0, reqH = 0, exitAfterFrames = 90;
     string keys, screenshotPath;
     for (int i = 1; i < argc; ++i) {
         string a = argv[i];
+        // Windows screensaver conventions: /s run, /c[:hwnd] configure, /p hwnd preview
+        if (a.size() >= 2 && (a[0] == '/' || a[0] == '-') && a.size() <= 3 + 10) {
+            char c = char(tolower((unsigned char)a[1]));
+            if (c == 's' && (a.size() == 2 || a[2] == ':')) { sim.saverMode = true; continue; }
+            if (c == 'c') {
+#ifdef _WIN32
+                MessageBoxA(nullptr,
+                    "Black Hole screensaver\n\n"
+                    "A Schwarzschild black hole with a Doppler-beamed accretion disk,\n"
+                    "a gravitationally lensed sky, and the icons of your installed apps\n"
+                    "spiralling past the event horizon.\n\n"
+                    "There are no settings. Any key or mouse movement exits.\n\n"
+                    "This is a computer simulation only: no spacetime is harmed.",
+                    "Black Hole screensaver", MB_OK | MB_ICONINFORMATION);
+#endif
+                return 0;
+            }
+            if (c == 'p') return 0;               // no preview rendering in the settings dialog
+        }
         if (a == "--stats") stats = true;
         else if (a == "--no-vsync") vsync = false;
         else if (a == "--fullscreen") startFullscreen = true;
+        else if (a == "--icons") wantIcons = true;
+        else if (a == "--saver") sim.saverMode = true;
         else if (a == "--size" && i + 1 < argc) { if (sscanf(argv[++i], "%dx%d", &reqW, &reqH) != 2) reqW = reqH = 0; }
         else if (a == "--keys" && i + 1 < argc) keys = argv[++i];
         else if (a == "--screenshot" && i + 1 < argc) screenshotPath = argv[++i];
@@ -756,21 +962,37 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--help" || a == "-h") {
-            cout << "usage: BlackHole3D [--stats] [--no-vsync] [--fullscreen] [--size WxH] [--keys <chars>]\n"
-                    "                   [--camera az,el,dist_rs] [--screenshot <file.bmp> [--frames N]]\n"; return 0;
+            cout << "usage: BlackHole3D [--stats] [--no-vsync] [--fullscreen] [--icons] [--saver] [--size WxH]\n"
+                    "                   [--keys <chars>] [--camera az,el,dist_rs] [--screenshot <file.bmp> [--frames N]]\n"; return 0;
         }
+    }
+#ifdef BH_SCREENSAVER
+    if (!sim.saverMode && screenshotPath.empty()) sim.saverMode = true;   // double-clicking the .scr
+#endif
+    if (sim.saverMode) {
+        Engine::coverScreen = true;
+        wantIcons = true;
+        sim.autoOrbit = true;
+        sim.showGrid = false;
     }
     // scripted capture: do not steal keyboard focus from whatever the user is doing
     if (!screenshotPath.empty()) Engine::noFocus = true;
     Engine eng;
     engine = &eng;
-    if (reqW > 0 && reqH > 0) glfwSetWindowSize(eng.window, reqW, reqH);
-    if (startFullscreen) eng.toggleFullscreen();
+    if (reqW > 0 && reqH > 0 && !sim.saverMode) glfwSetWindowSize(eng.window, reqW, reqH);
+    if (startFullscreen && !sim.saverMode) eng.toggleFullscreen();
     glfwSwapInterval(vsync ? 1 : 0);
     setupObjects();
     setupCallbacks(eng.window);
-    printHelp();
+    if (!sim.saverMode) printHelp();
     applyKeyString(eng.window, keys);
+    if (wantIcons) {
+        iconAtlas = harvestAppIcons(48);
+        eng.uploadAtlas(iconAtlas);
+        sim.showIcons = iconAtlas.count > 0;
+        cout << "[INFO] harvested " << iconAtlas.count << " app icons" << endl;
+        for (int i = 0; i < 6; ++i) spawnIcon();          // start with a few already in orbit
+    }
     double statsTime = glfwGetTime();
 
     double lastTime = glfwGetTime(), fpsTime = lastTime;
@@ -786,7 +1008,13 @@ int main(int argc, char** argv) {
         if (sim.orbitsRunning) {
             double simDt = dt * sim.timeScale;
             stepOrbits(simDt);
+            stepIcons(simDt, dt, now);
             sim.simTime += simDt;
+        }
+        if (sim.autoOrbit && !camera.dragging) {
+            camera.azimuth  += float(dt * 0.035);
+            camera.elevation = 1.22f + 0.16f * float(std::sin(now * 0.09));
+            camera.radius    = float(SagA.r_s) * (13.0f + 2.5f * float(std::sin(now * 0.053)));
         }
 
         glViewport(0, 0, eng.WIDTH, eng.HEIGHT);
@@ -838,7 +1066,8 @@ int main(int argc, char** argv) {
               << "  |  disk " << (sim.showDisk ? "on" : "off")
               << "  doppler " << (sim.doppler ? "on" : "off")
               << "  stars " << (sim.showStars ? "on" : "off")
-              << "  grid " << (sim.showGrid ? "on" : "off");
+              << "  grid " << (sim.showGrid ? "on" : "off")
+              << "  icons " << (sim.showIcons ? std::to_string(icons.size()) : "off");
             glfwSetWindowTitle(eng.window, t.str().c_str());
             if (stats && now - statsTime >= 2.0) {
                 cout << "[STATS] " << t.str() << endl;
@@ -849,3 +1078,8 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
+#ifdef BH_SCREENSAVER
+// The .scr is a GUI-subsystem executable (no console window); forward to main().
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) { return main(__argc, __argv); }
+#endif

@@ -54,6 +54,20 @@ layout(std140, binding = 3) uniform Objects {
     vec4 objColor[16];       // rgb = colour, a = emissive strength
 };
 
+// App-icon sprites: camera-facing textured quads that fall into the hole.
+layout(std140, binding = 4) uniform Sprites {
+    int   numSprites;
+    float atlasCols;
+    float atlasRows;
+    float _sp0;
+    vec4  spritePos[32];    // xyz = centre (metres), w = half size (metres)
+    vec4  spriteInfo[32];   // x = atlas index, y = brightness, z = radial stretch, w = spin (rad)
+    vec4  spriteN[32];      // billboard normal (towards the camera), w = bounding radius^2 (rs units)
+    vec4  spriteR[32];      // in-plane radial axis (towards the hole), w = cos(spin)
+    vec4  spriteT[32];      // in-plane tangential axis,               w = sin(spin)
+};
+layout(binding = 1) uniform sampler2D iconAtlas;
+
 const int FLAG_DISK     = 1;
 const int FLAG_STARS    = 2;
 const int FLAG_DOPPLER  = 4;
@@ -186,6 +200,38 @@ float segmentSphere(vec3 p0, vec3 p1, vec3 C, float R) {
     return (t >= 0.0 && t <= 1.0) ? t : -1.0;
 }
 
+// Segment / icon-sprite intersection.  Returns t in [0,1] or -1; outputs the
+// (linear) colour at the hit.  Transparent texels let the ray pass.
+float segmentSprite(vec3 p0, vec3 p1, int k, out vec3 col) {
+    col = vec3(0.0);
+    vec3  C  = spritePos[k].xyz / rs;
+    vec3  n  = spriteN[k].xyz;                         // billboard faces the camera (CPU precomputed)
+    vec3  d  = p1 - p0;
+    float denom = dot(d, n);
+    if (abs(denom) < 1e-12) return -1.0;
+    float t = dot(C - p0, n) / denom;
+    if (t < 0.0 || t > 1.0) return -1.0;
+    vec3 X = p0 + t * d - C;
+    if (dot(X, X) > spriteN[k].w) return -1.0;         // outside the bounding circle
+
+    // tidal "spaghettification": stretch along the radial axis, squeeze across it
+    float hs = spritePos[k].w / rs;
+    float stretch = spriteInfo[k].z;
+    float lx = dot(X, spriteR[k].xyz) / (hs * stretch);
+    float ly = dot(X, spriteT[k].xyz) * sqrt(stretch) / hs;
+    float ca = spriteR[k].w, sa = spriteT[k].w;
+    vec2 q = vec2(ca * lx - sa * ly, sa * lx + ca * ly);
+    if (abs(q.x) > 1.0 || abs(q.y) > 1.0) return -1.0;
+
+    float idx = spriteInfo[k].x;
+    vec2 cell = vec2(mod(idx, atlasCols), floor(idx / atlasCols));
+    vec2 uv = (cell + (q * 0.5 + 0.5)) / vec2(atlasCols, atlasRows);
+    vec4 s = textureLod(iconAtlas, uv, 0.0);
+    if (s.a < 0.5) return -1.0;
+    col = pow(s.rgb, vec3(2.2)) * spriteInfo[k].y * 1.25;    // sRGB -> linear, redshift fade
+    return t;
+}
+
 // ------------------------------------------------------------ disk shading
 vec3 shadeDisk(vec3 X, vec3 photonDir /* direction light travels, towards camera */) {
     float r   = length(X.xz);               // in rs
@@ -265,7 +311,8 @@ void main() {
     float phi = 0.0;
     vec3 pos = O;
 
-    bool hitBH = false, hitDisk = false, hitObj = false, escaped = false;
+    bool hitBH = false, hitDisk = false, hitObj = false, hitSprite = false, escaped = false;
+    vec3 spriteColor = vec3(0.0);
     vec3 hitPos = vec3(0.0), segDir = D;
     int  hitIndex = -1;
     vec3 escapeDir = D;
@@ -313,6 +360,14 @@ void main() {
             break;
         }
 
+        // app-icon sprites
+        for (int k = 0; k < numSprites; ++k) {
+            vec3 sc;
+            float t = segmentSprite(pos, newPos, k, sc);
+            if (t >= 0.0 && t < bestT) { bestT = t; spriteColor = sc; hitSprite = true; }
+        }
+        if (hitSprite) break;
+
         pos = newPos;
         if (rn > escapeR && s.y < 0.0) {                 // far away and still moving outwards
             float drd = -s.y * rn * rn;
@@ -328,6 +383,8 @@ void main() {
         color = shadeDisk(hitPos, -segDir);
     } else if (hitBH) {
         color = vec3(0.0);
+    } else if (hitSprite) {
+        color = spriteColor;
     } else if (hitObj) {
         vec3 C = objPosRadius[hitIndex].xyz / rs;
         vec3 N = normalize(hitPos - C);
@@ -349,6 +406,6 @@ void main() {
 
     // alpha = 1 where the ray reached the sky; the grid overlay uses it so the
     // black hole, disk and stars occlude the spacetime grid behind them.
-    float sky = (hitDisk || hitBH || hitObj) ? 0.0 : 1.0;
+    float sky = (hitDisk || hitBH || hitObj || hitSprite) ? 0.0 : 1.0;
     imageStore(outImage, pix, vec4(tonemap(color), sky));
 }
