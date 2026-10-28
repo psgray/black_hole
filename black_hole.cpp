@@ -939,7 +939,7 @@ int main(int argc, char** argv) {
                     "a gravitationally lensed sky, and the icons of your installed apps\n"
                     "spiralling past the event horizon.\n\n"
                     "There are no settings. Any key or mouse movement exits.\n\n"
-                    "This is a computer simulation only: no spacetime is harmed.",
+                    "This is a computer simulation only. Any effects on spacetime caused by this build are minimal.",
                     "Black Hole screensaver", MB_OK | MB_ICONINFORMATION);
 #endif
                 return 0;

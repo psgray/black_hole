@@ -112,7 +112,7 @@ The same source also builds `BlackHoleSaver.scr`. It harvests the icons of your 
 - The thin accretion disk (ISCO at 3 r_s to 7.5 r_s) is shaded as a blackbody with the standard `T⁴ ∝ r⁻³(1-√(r_in/r))` profile, gravitational redshift and relativistic Doppler beaming from its Keplerian orbital speed, plus a turbulent texture that co-rotates with the gas. The far side of the disk appears bent over and under the shadow, and the thin photon ring at 1.5 r_s is visible.
 - Rays that escape sample a procedural starfield in their final, lensed direction, so the sky is smeared into the Einstein ring around the shadow.
 - The two stars follow stable Keplerian orbits (leapfrog integrator) and are lensed like everything else. The spacetime grid is Flamm's paraboloid embedding of the equatorial plane, drawn behind the ray-traced scene.
-- Note: this is purely a computer simulation. No black holes are created or operated by running it.
+- Note: this is purely a computer simulation. No black holes are created or operated by running it; any effects on spacetime caused by this build are minimal.
 
 ## **How the code works:**
 for 2D: simple, just run 2D_lensing.cpp with the nessesary dependencies installed.
